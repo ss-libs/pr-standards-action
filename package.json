@@ -1,0 +1,31 @@
+{
+  "name": "@ss-libs/pr-standards-action",
+  "version": "1.0.0",
+  "description": "GitHub Action for automated PR code review against team standards using Claude AI",
+  "main": "scripts/action-entrypoint.js",
+  "scripts": {
+    "test": "echo \"No tests yet\" && exit 0"
+  },
+  "keywords": [
+    "github-action",
+    "code-review",
+    "standards",
+    "linter",
+    "claude",
+    "ai"
+  ],
+  "author": "SS Labs",
+  "license": "MIT",
+  "dependencies": {
+    "@actions/core": "^1.10.1",
+    "@actions/github": "^6.0.0",
+    "@aws-sdk/client-bedrock-runtime": "^3.699.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ss-libs/pr-standards-action.git"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

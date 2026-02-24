@@ -1,0 +1,70 @@
+name: 'PR Standards Checker'
+description: 'Automated code review against team standards using Claude AI'
+author: 'SS Labs'
+
+branding:
+  icon: 'check-circle'
+  color: 'blue'
+
+inputs:
+  github-token:
+    description: 'GitHub token for posting comments'
+    required: true
+  pr-number:
+    description: 'Pull request number'
+    required: true
+  repository:
+    description: 'Repository name (owner/repo)'
+    required: true
+  bedrock-aws-access-key-id:
+    description: 'AWS Bedrock access key ID'
+    required: true
+  bedrock-aws-secret-access-key:
+    description: 'AWS Bedrock secret access key'
+    required: true
+  bedrock-region:
+    description: 'AWS Bedrock region'
+    required: false
+    default: 'us-east-1'
+  model-id:
+    description: 'Claude model ID or inference profile ARN'
+    required: false
+    default: 'arn:aws:bedrock:us-east-1:257394448189:inference-profile/us.anthropic.claude-opus-4-6-v1'
+  standards-file:
+    description: 'Path to custom standards file (relative to repo root)'
+    required: false
+    default: ''
+  ignore-config-file:
+    description: 'Path to custom ignore config file (relative to repo root)'
+    required: false
+    default: ''
+  fail-on-issues:
+    description: 'Fail the action if issues are found'
+    required: false
+    default: 'true'
+  failure-mode:
+    description: 'How to handle failures: "fail" to fail the pipeline, "label" to add a label to the PR instead'
+    required: false
+    default: 'fail'
+  noncompliant-label:
+    description: 'Label to add to the PR when failure-mode is "label" and issues are found'
+    required: false
+    default: 'Noncompliant'
+  max-tokens:
+    description: 'Maximum tokens for Claude response'
+    required: false
+    default: '16000'
+
+outputs:
+  issues-found:
+    description: 'Total number of issues found'
+  high-priority-count:
+    description: 'Number of high priority issues'
+  medium-priority-count:
+    description: 'Number of medium priority issues'
+  low-priority-count:
+    description: 'Number of low priority issues'
+
+runs:
+  using: 'node20'
+  main: 'scripts/action-entrypoint.js'

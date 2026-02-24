@@ -1,0 +1,35 @@
+name: PR Standards
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  pr-standards:
+    if: ${{ !github.event.pull_request.draft && !github.event.pull_request.merged }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check PR standards
+        uses: ss-libs/pr-standards-action@v1.0.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          pr-number: ${{ github.event.pull_request.number }}
+          repository: ${{ github.repository }}
+          bedrock-aws-access-key-id: ${{ secrets.BEDROCK_AWS_ACCESS_KEY_ID }}
+          bedrock-aws-secret-access-key: ${{ secrets.BEDROCK_AWS_SECRET_ACCESS_KEY }}
+          # Optional: use a custom standards file
+          # standards-file: '.github/PR_STANDARDS.md'
+          # Optional: apply a label instead of failing the build
+          # failure-mode: label
