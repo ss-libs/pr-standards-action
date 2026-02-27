@@ -6,10 +6,12 @@ Automated PR code review using Claude AI to enforce your team's coding standards
 
 - 🤖 **AI-Powered Review**: Uses Claude via AWS Bedrock to analyze code changes
 - 📍 **Inline Comments**: Posts findings directly on the relevant diff lines
-- 🔁 **Smart Re-reviews**: On follow-up pushes, only shows new issues in full — persisting ones are listed by title only
+- 🔁 **Thread-Aware Re-reviews**: On follow-up pushes, persisting issues are bumped as replies on their existing threads — no duplicate comments
+- 💬 **User Reply Evaluation**: Claude reads developer responses to open review comments and resolves threads where the explanation is valid
 - 📋 **Customizable Standards**: Bring your own standards file or use the built-in defaults
 - 🏷️ **Flexible Failure Mode**: Fail the build or apply a label — your choice
 - 🚫 **Ignore Support**: Exclude files, folders, or specific code sections from review
+- 📝 **PR-Level Notes**: Title and description issues are posted as conversation comments, not random inline annotations
 - ✅ **Pass Confirmation**: Posts a success comment when the PR clears all checks
 - 🔒 **Secure**: Runs with your own AWS Bedrock credentials
 
@@ -161,6 +163,20 @@ The label is created automatically if it doesn't exist. It is removed when the P
 Add to your repository settings:
 - `BEDROCK_AWS_ACCESS_KEY_ID`
 - `BEDROCK_AWS_SECRET_ACCESS_KEY`
+
+## How Re-reviews Work
+
+Each time the action runs on a PR that already has open bot review threads:
+
+1. **Persisting issues** — a reply is posted on the existing thread to bump it. No duplicate inline comment is created.
+2. **Fixed issues** — the thread is automatically resolved.
+3. **User-explained issues** — if you reply to a bot comment explaining why the pattern is intentional, Claude evaluates the explanation against your standards. If it's valid, the thread is resolved with an acknowledgement; if not, it's bumped with a note on why the explanation was insufficient.
+4. **New issues** — posted as fresh inline comments as usual.
+5. **PR-level notes** — concerns about the title, description, or missing context appear as a plain conversation comment rather than as inline annotations on code files.
+
+### Required Permissions
+
+Thread resolution uses the GitHub GraphQL API, which requires the workflow's `GITHUB_TOKEN` to have `pull-requests: write`. This is already needed to post comments, so no additional setup is required.
 
 ## Troubleshooting
 
