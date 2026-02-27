@@ -365,7 +365,7 @@ function getDirectoryStructure() {
 /**
  * Call Claude Opus to analyze the PR
  */
-async function analyzeWithClaude(prDetails, diff, fileContents, relatedFiles, patterns, modelId, previousComment) {
+async function analyzeWithClaude(prDetails, diff, fileContents, relatedFiles, patterns, modelId, reviewThreads) {
   const client = new BedrockRuntimeClient({
     region: AWS_REGION,
     credentials: {
@@ -374,7 +374,7 @@ async function analyzeWithClaude(prDetails, diff, fileContents, relatedFiles, pa
     },
   });
 
-  const prompt = buildAnalysisPrompt(prDetails, diff, fileContents, relatedFiles, patterns, previousComment);
+  const prompt = buildAnalysisPrompt(prDetails, diff, fileContents, relatedFiles, patterns, reviewThreads);
 
   try {
     const payload = {
@@ -417,7 +417,7 @@ async function analyzeWithClaude(prDetails, diff, fileContents, relatedFiles, pa
 /**
  * Build the analysis prompt with all context
  */
-function buildAnalysisPrompt(prDetails, diff, fileContents, relatedFiles, patterns, previousComment) {
+function buildAnalysisPrompt(prDetails, diff, fileContents, relatedFiles, patterns, reviewThreads) {
   const standardsNote = `You have access to the team standards document at .github/PR_STANDARDS.md. Reference it as the authoritative source for all standards.`;
 
   let prompt = `You are a senior code reviewer. Review this pull request against the team coding standards and identify issues.
@@ -475,9 +475,25 @@ ${diff.slice(0, 100000)}${diff.length > 100000 ? '\n... (diff truncated, see ful
     }
   }
 
-  // Add previous review comment for context on re-reviews
-  if (previousComment) {
-    prompt += `\n## Previous Review Comment\n\nThe following is the most recent automated standards check comment on this PR. Use it to distinguish between persisting issues and new ones:\n\n${previousComment}\n\n`;
+  // Add existing open inline review threads (with user replies) for re-review context
+  const isReReview = reviewThreads && reviewThreads.length > 0;
+  if (isReReview) {
+    prompt += `\n## Existing Open Inline Review Comment Threads\n\n`;
+    prompt += `The following are unresolved inline review comments from previous standards checks. `;
+    prompt += `Each thread may include replies from the PR author or other reviewers.\n\n`;
+    for (const thread of reviewThreads) {
+      prompt += `### "${thread.botTitle}" (\`${thread.path}:${thread.line}\`)\n\n`;
+      prompt += `**Bot comment:**\n${thread.botBody}\n\n`;
+      if (thread.userReplies.length > 0) {
+        prompt += `**User replies:**\n`;
+        for (const reply of thread.userReplies) {
+          prompt += `- @${reply.author}: ${reply.body}\n`;
+        }
+        prompt += '\n';
+      } else {
+        prompt += `*No user replies yet.*\n\n`;
+      }
+    }
   }
 
   prompt += `
@@ -530,8 +546,12 @@ Classify each issue into one of two groups:
 - Minor naming improvements
 - console.log instead of logger
 
-${previousComment ? `
-This is a RE-REVIEW. A previous standards check comment is provided above.
+${isReReview ? `
+This is a RE-REVIEW. Open inline comment threads from previous checks are listed above.
+
+For each existing thread, evaluate:
+1. Is the underlying issue still present in the current code?
+2. If the user replied, does their explanation legitimately justify the pattern (e.g. referencing a library that handles it, intentional design with clear rationale)?
 
 Output your findings as a single JSON code block and nothing else. Use exactly this schema:
 
@@ -542,9 +562,10 @@ Output your findings as a single JSON code block and nothing else. Use exactly t
   "persisting": [
     {
       "priority": "must_fix or other",
-      "title": "Title matching an issue from the previous review",
+      "title": "Title exactly matching an existing thread listed above",
       "path": "src/file.ts",
-      "line": 42
+      "line": 42,
+      "bump_message": "Optional: 1 sentence explaining why this is still an issue (include if user replied but explanation was insufficient)"
     }
   ],
   "new_findings": [
@@ -556,18 +577,23 @@ Output your findings as a single JSON code block and nothing else. Use exactly t
       "body": "Concise explanation. Must-fix findings should include a corrected code snippet in a markdown fenced block."
     }
   ],
-  "resolved": ["Title of each issue from the previous review that has been fixed"]
+  "resolved": ["Title of each existing thread where the code was fixed"],
+  "accepted_explanations": ["Title of each existing thread where the user's reply provides a valid and complete justification"],
+  "general_notes": ["Any concern about the PR itself — title, description, missing context — that is not tied to a specific code line"]
 }
 \`\`\`
 
 Rules:
 - Output ONLY the JSON code block — no prose before or after
-- \`persisting\`: ONLY include issues from the previous review that are STILL PRESENT — title and location, no body needed
-- \`new_findings\`: ONLY issues NOT mentioned in the previous review, with full \`body\` explanation
+- \`persisting\`: issues from existing threads that are STILL PRESENT and NOT adequately explained
+- \`new_findings\`: issues NOT covered by any existing open thread, with full \`body\`
+- \`resolved\`: existing threads where the underlying code was fixed (regardless of user replies)
+- \`accepted_explanations\`: existing threads where the user's reply is a legitimate justification even though the pattern remains
+- \`general_notes\`: PR-level concerns (bad title, missing description, etc.) — do NOT include issues that can be tied to a specific file and line
 - \`path\` must exactly match a file path from the Changed Files Summary above
 - \`line\` must be a line number in the NEW version of the file that appears in the diff
 - Only report issues on lines that were added or modified in this PR
-- Set \`status\` to \`BLOCK_MERGE\` if any \`must_fix\` issues exist (persisting or new)
+- Set \`status\` to \`BLOCK_MERGE\` if any \`must_fix\` issues exist in \`persisting\` or \`new_findings\`
 - Omit empty arrays from the output
 ` : `
 Output your findings as a single JSON code block and nothing else. Use exactly this schema:
@@ -584,7 +610,8 @@ Output your findings as a single JSON code block and nothing else. Use exactly t
       "line": 42,
       "body": "Concise explanation. Must-fix findings should include a corrected code snippet in a markdown fenced block."
     }
-  ]
+  ],
+  "general_notes": ["Any concern about the PR itself — title, description, missing context — that is not tied to a specific code line"]
 }
 \`\`\`
 
@@ -593,6 +620,7 @@ Rules:
 - \`path\` must exactly match a file path from the Changed Files Summary above
 - \`line\` must be a line number in the NEW version of the file that appears in the diff
 - Only report issues on lines that were added or modified in this PR
+- \`general_notes\`: PR-level concerns (bad title, missing description, etc.) — do NOT include issues that can be tied to a specific file and line
 - Set \`status\` to \`BLOCK_MERGE\` if any \`must_fix\` findings exist
 - Omit empty arrays from the output
 `}
@@ -674,6 +702,22 @@ async function postComment(comment, modelId) {
 }
 
 /**
+ * Post general PR-level notes (title, description issues, etc.) as a plain
+ * conversation comment rather than inline on a code file.
+ */
+async function postGeneralNotes(notes, modelId) {
+  if (!notes || notes.length === 0) return;
+
+  let body = `## 📋 PR Standards — General Notes\n\n`;
+  for (const note of notes) {
+    body += `- ${note}\n`;
+  }
+  body += `\n*🤖 Automated review using AI. Model: ${modelId}. Human review still required for final approval.*`;
+
+  await postComment(body, null);
+}
+
+/**
  * Post a success comment to the PR
  */
 async function postSuccessComment(modelId) {
@@ -685,21 +729,155 @@ async function postSuccessComment(modelId) {
 }
 
 /**
- * Fetch the body of the most recent standards check comment, if any
+ * Run a GraphQL query/mutation against the GitHub API.
+ * Writes the request to a temp file to avoid shell-escaping issues.
  */
-async function getPreviousCheckComment() {
+function runGraphQL(query, variables = {}) {
+  const tempFile = path.join('/tmp', `graphql-${Date.now()}.json`);
   try {
-    const output = execSync(
-      `gh pr view ${PR_NUMBER} --repo ${REPO} --json comments --jq '[.comments[] | select(.author.login == "github-actions") | select(.body | contains("PR Standards Check"))] | last | .body'`,
+    fs.writeFileSync(tempFile, JSON.stringify({ query, variables }), 'utf8');
+    const result = execSync(`gh api graphql --input "${tempFile}"`, { encoding: 'utf8' });
+    fs.unlinkSync(tempFile);
+    return JSON.parse(result);
+  } catch (error) {
+    if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile);
+    throw error;
+  }
+}
+
+/**
+ * Fetch all open standards-checker inline review threads for the PR.
+ * Returns an array of thread objects with their conversation history.
+ */
+async function getReviewThreads() {
+  const [owner, repoName] = REPO.split('/');
+  const query = `
+    query($owner: String!, $repo: String!, $number: Int!) {
+      repository(owner: $owner, name: $repo) {
+        pullRequest(number: $number) {
+          reviewThreads(first: 100) {
+            nodes {
+              id
+              isResolved
+              path
+              line
+              comments(first: 50) {
+                nodes {
+                  databaseId
+                  body
+                  createdAt
+                  author { login }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  `;
+  try {
+    const data = runGraphQL(query, { owner, repo: repoName, number: parseInt(PR_NUMBER, 10) });
+    const threads = data.data?.repository?.pullRequest?.reviewThreads?.nodes || [];
+
+    return threads
+      .filter(t => {
+        if (t.isResolved) return false;
+        const first = t.comments?.nodes?.[0];
+        return first && first.author?.login === 'github-actions';
+      })
+      .map(t => {
+        const comments = t.comments?.nodes || [];
+        const botComment = comments[0];
+        const userReplies = comments.slice(1).filter(c => c.author?.login !== 'github-actions');
+
+        // Extract finding title from "🔴 **Title**" or "🟡 **Title**"
+        const titleMatch = botComment.body.match(/[🔴🟡]\s*\*\*(.*?)\*\*/);
+        const botTitle = titleMatch ? titleMatch[1].trim() : 'Unknown Issue';
+
+        return {
+          threadId: t.id,
+          firstCommentId: botComment.databaseId,
+          path: t.path,
+          line: t.line,
+          botTitle,
+          botBody: botComment.body,
+          userReplies: userReplies.map(r => ({
+            author: r.author?.login || 'unknown',
+            body: r.body,
+            createdAt: r.createdAt,
+          })),
+        };
+      });
+  } catch (error) {
+    console.warn('⚠️  Could not fetch review threads:', error.message);
+    return [];
+  }
+}
+
+/**
+ * Resolve an inline review thread via GraphQL.
+ */
+async function resolveReviewThread(threadId) {
+  const mutation = `
+    mutation($id: ID!) {
+      resolveReviewThread(input: { threadId: $id }) {
+        thread { isResolved }
+      }
+    }
+  `;
+  try {
+    runGraphQL(mutation, { id: threadId });
+    console.log(`  ✓ Resolved thread ${threadId}`);
+  } catch (error) {
+    console.warn(`  ⚠️  Could not resolve thread ${threadId}:`, error.message);
+  }
+}
+
+/**
+ * Post a reply to an existing inline review comment.
+ */
+async function replyToReviewComment(commentId, body) {
+  const tempFile = path.join('/tmp', `pr-reply-${Date.now()}.json`);
+  try {
+    fs.writeFileSync(tempFile, JSON.stringify({ body }), 'utf8');
+    execSync(
+      `gh api repos/${REPO}/pulls/${PR_NUMBER}/comments/${commentId}/replies --method POST --input "${tempFile}"`,
       { encoding: 'utf8' }
     );
-    const body = output.trim();
-    if (!body || body === 'null') return null;
-    return body;
+    console.log(`  ✓ Replied to comment ${commentId}`);
+    fs.unlinkSync(tempFile);
   } catch (error) {
-    console.warn('⚠️  Could not fetch previous check comment:', error.message);
-    return null;
+    if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile);
+    console.warn(`  ⚠️  Could not reply to comment ${commentId}:`, error.message);
   }
+}
+
+/**
+ * Find the best-matching open thread for a given finding title and path.
+ * Tries exact normalized title match, then substring match, then path match.
+ */
+function findMatchingThread(threads, title, filePath) {
+  const norm = s => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+  const normTitle = norm(title);
+
+  // Exact normalized title match
+  let match = threads.find(t => norm(t.botTitle) === normTitle);
+  if (match) return match;
+
+  // Substring match (either direction)
+  match = threads.find(t => {
+    const nt = norm(t.botTitle);
+    return nt.includes(normTitle) || normTitle.includes(nt);
+  });
+  if (match) return match;
+
+  // Path match (last resort)
+  if (filePath) {
+    match = threads.find(t => t.path === filePath);
+    if (match) return match;
+  }
+
+  return null;
 }
 
 /**
@@ -804,13 +982,12 @@ function buildReviewBody(data, isReReview, modelId, unplaceable) {
   if (data.summary) body += `${data.summary}\n\n`;
 
   if (isReReview) {
-    if (data.persisting?.length) {
-      body += `## ⏳ Still Open\n\n`;
-      for (const f of data.persisting) {
-        body += `${priorityIcon(f.priority)} **${f.title}** (\`${f.path}:${f.line}\`)\n`;
-      }
-      body += '\n';
+    // Persisting issues are bumped as replies on existing threads — just show a count here.
+    const persistingCount = data.persisting?.length || 0;
+    if (persistingCount > 0) {
+      body += `> ⏳ **${persistingCount} issue(s) from the previous review are still open** — see the existing inline comments above.\n\n`;
     }
+
     if (data.new_findings?.length) {
       body += `## 🆕 New Issues\n\n`;
       for (const f of data.new_findings) {
@@ -821,6 +998,11 @@ function buildReviewBody(data, isReReview, modelId, unplaceable) {
     if (data.resolved?.length) {
       body += `## ✅ Resolved\n\n`;
       for (const r of data.resolved) body += `- ${r}\n`;
+      body += '\n';
+    }
+    if (data.accepted_explanations?.length) {
+      body += `## 💬 Accepted Explanations\n\n`;
+      for (const r of data.accepted_explanations) body += `- ${r}\n`;
       body += '\n';
     }
   } else {
@@ -853,21 +1035,21 @@ function buildReviewBody(data, isReReview, modelId, unplaceable) {
 /**
  * Post a PR review with inline comments for each finding, falling back to the
  * review body for any findings whose line numbers are not in the diff.
+ * On re-reviews, persisting issues are bumped as replies on existing threads rather
+ * than posted as new inline comments, and resolved/accepted threads are closed.
  */
-async function postReview(data, diff, modelId, isReReview) {
+async function postReview(data, diff, modelId, isReReview, reviewThreads = []) {
   const validLines = parseDiffForValidLines(diff);
 
-  const allFindings = isReReview
-    ? [
-        ...(data.persisting || []).map(f => ({ ...f, inlineBody: `⏳ **Still open:** ${f.title}` })),
-        ...(data.new_findings || []).map(f => ({ ...f, inlineBody: f.body })),
-      ]
-    : (data.findings || []).map(f => ({ ...f, inlineBody: f.body }));
+  // Determine which findings need new inline comments
+  const findingsForInline = isReReview
+    ? (data.new_findings || [])
+    : (data.findings || []);
 
   const inlineComments = [];
   const unplaceable = [];
 
-  for (const finding of allFindings) {
+  for (const finding of findingsForInline) {
     const fileLines = validLines.get(finding.path);
     if (fileLines && fileLines.has(finding.line)) {
       const icon = finding.priority === 'must_fix' ? '🔴' : '🟡';
@@ -875,7 +1057,7 @@ async function postReview(data, diff, modelId, isReReview) {
         path: finding.path,
         line: finding.line,
         side: 'RIGHT',
-        body: `${icon} **${finding.title}**\n\n${finding.inlineBody}`,
+        body: `${icon} **${finding.title}**\n\n${finding.body}`,
       });
     } else {
       unplaceable.push(finding);
@@ -899,6 +1081,39 @@ async function postReview(data, diff, modelId, isReReview) {
   } catch (error) {
     if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile);
     throw error;
+  }
+
+  if (!isReReview) return;
+
+  // Re-review: bump persisting threads with a reply instead of posting duplicate inline comments
+  for (const finding of (data.persisting || [])) {
+    const thread = findMatchingThread(reviewThreads, finding.title, finding.path);
+    if (thread) {
+      const icon = finding.priority === 'must_fix' ? '🔴' : '🟡';
+      const bumpBody = finding.bump_message
+        ? `${icon} **Still open.** ${finding.bump_message}`
+        : `${icon} **Still open.** This issue has not been resolved yet.`;
+      await replyToReviewComment(thread.firstCommentId, bumpBody);
+    } else {
+      console.log(`  ⚠️  No matching thread found for persisting issue: "${finding.title}"`);
+    }
+  }
+
+  // Resolve threads for issues fixed in the code
+  for (const title of (data.resolved || [])) {
+    const thread = findMatchingThread(reviewThreads, title, null);
+    if (thread) {
+      await resolveReviewThread(thread.threadId);
+    }
+  }
+
+  // Accept explanations: reply with acknowledgement then resolve
+  for (const title of (data.accepted_explanations || [])) {
+    const thread = findMatchingThread(reviewThreads, title, null);
+    if (thread) {
+      await replyToReviewComment(thread.firstCommentId, '✅ Explanation accepted. Resolving this comment.');
+      await resolveReviewThread(thread.threadId);
+    }
   }
 }
 
@@ -938,11 +1153,11 @@ async function main() {
   }
 
   try {
-    // Fetch previous check comment for re-review context
-    console.log('🔍 Checking for previous review comments...');
-    const previousComment = await getPreviousCheckComment();
-    if (previousComment) {
-      console.log('ℹ️  Previous review found — will compare against it');
+    // Fetch open inline review threads for re-review context
+    console.log('🔍 Checking for open review threads...');
+    const reviewThreads = await getReviewThreads();
+    if (reviewThreads.length > 0) {
+      console.log(`ℹ️  ${reviewThreads.length} open review thread(s) found — will compare and bump/resolve as appropriate`);
     }
 
     // Get the latest Claude Opus model
@@ -970,7 +1185,7 @@ async function main() {
 
     // Analyze with Claude
     console.log('\n🤖 Analyzing PR with Claude...');
-    const rawAnalysis = await analyzeWithClaude(prDetails, diff, fileContents, relatedFiles, patterns, modelId, previousComment);
+    const rawAnalysis = await analyzeWithClaude(prDetails, diff, fileContents, relatedFiles, patterns, modelId, reviewThreads);
 
     // Parse the structured JSON response
     const analysisData = parseAnalysisJSON(rawAnalysis);
@@ -978,10 +1193,16 @@ async function main() {
       throw new Error('Analysis did not return a parseable JSON response');
     }
 
-    // Post review with inline comments
+    // Post review with inline comments; bump/resolve existing threads on re-review
     console.log('💬 Posting review with inline comments...');
-    const isReReview = !!previousComment;
-    await postReview(analysisData, diff, modelId, isReReview);
+    const isReReview = reviewThreads.length > 0;
+    await postReview(analysisData, diff, modelId, isReReview, reviewThreads);
+
+    // Post any general PR-level notes as a plain conversation comment
+    if (analysisData.general_notes?.length) {
+      console.log('📋 Posting general PR notes...');
+      await postGeneralNotes(analysisData.general_notes, modelId);
+    }
 
     console.log('✅ PR standards check complete!\n');
 
