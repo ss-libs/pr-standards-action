@@ -736,9 +736,16 @@ function runGraphQL(query, variables = {}) {
   const tempFile = path.join('/tmp', `graphql-${Date.now()}.json`);
   try {
     fs.writeFileSync(tempFile, JSON.stringify({ query, variables }), 'utf8');
-    const result = execSync(`gh api graphql --input "${tempFile}"`, { encoding: 'utf8' });
+    // Use 'gh api -X POST graphql' (not 'gh api graphql') so the full JSON body
+    // including variables is POSTed directly without subcommand pre-processing.
+    const result = execSync(`gh api -X POST graphql --input "${tempFile}"`, { encoding: 'utf8' });
     fs.unlinkSync(tempFile);
-    return JSON.parse(result);
+    const parsed = JSON.parse(result);
+    // GitHub GraphQL always returns HTTP 200; actual failures appear in 'errors'.
+    if (parsed.errors && parsed.errors.length > 0) {
+      throw new Error(parsed.errors.map(e => e.message).join('; '));
+    }
+    return parsed;
   } catch (error) {
     if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile);
     throw error;
@@ -779,16 +786,18 @@ async function getReviewThreads() {
     const data = runGraphQL(query, { owner, repo: repoName, number: parseInt(PR_NUMBER, 10) });
     const threads = data.data?.repository?.pullRequest?.reviewThreads?.nodes || [];
 
+    const isBotLogin = login => login === 'github-actions[bot]' || login === 'github-actions';
+
     return threads
       .filter(t => {
         if (t.isResolved) return false;
         const first = t.comments?.nodes?.[0];
-        return first && first.author?.login === 'github-actions';
+        return first && isBotLogin(first.author?.login);
       })
       .map(t => {
         const comments = t.comments?.nodes || [];
         const botComment = comments[0];
-        const userReplies = comments.slice(1).filter(c => c.author?.login !== 'github-actions');
+        const userReplies = comments.slice(1).filter(c => !isBotLogin(c.author?.login));
 
         // Extract finding title from "🔴 **Title**" or "🟡 **Title**"
         const titleMatch = botComment.body.match(/[🔴🟡]\s*\*\*(.*?)\*\*/);
@@ -826,8 +835,12 @@ async function resolveReviewThread(threadId) {
     }
   `;
   try {
-    runGraphQL(mutation, { id: threadId });
-    console.log(`  ✓ Resolved thread ${threadId}`);
+    const result = runGraphQL(mutation, { id: threadId });
+    if (result.data?.resolveReviewThread?.thread?.isResolved === true) {
+      console.log(`  ✓ Resolved thread ${threadId}`);
+    } else {
+      console.warn(`  ⚠️  resolveReviewThread returned unexpected response for ${threadId}:`, JSON.stringify(result));
+    }
   } catch (error) {
     console.warn(`  ⚠️  Could not resolve thread ${threadId}:`, error.message);
   }
