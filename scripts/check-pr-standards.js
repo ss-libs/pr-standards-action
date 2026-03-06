@@ -1245,8 +1245,8 @@ async function main() {
       }
     } else {
       console.log('\n✅ No issues found - PR meets all quality standards\n');
-      await postSuccessComment(modelId);
       await removeLabelIfPresent();
+      await postSuccessComment(modelId);
     }
   } catch (error) {
     console.error('❌ Error during PR standards check:', error.message);
