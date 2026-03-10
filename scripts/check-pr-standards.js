@@ -365,7 +365,7 @@ function getDirectoryStructure() {
 /**
  * Call Claude Opus to analyze the PR
  */
-async function analyzeWithClaude(prDetails, diff, fileContents, relatedFiles, patterns, modelId, reviewThreads) {
+async function analyzeWithClaude(prDetails, diff, fileContents, relatedFiles, patterns, modelId, reviewThreads, resolvedThreads = []) {
   const client = new BedrockRuntimeClient({
     region: AWS_REGION,
     credentials: {
@@ -374,7 +374,7 @@ async function analyzeWithClaude(prDetails, diff, fileContents, relatedFiles, pa
     },
   });
 
-  const prompt = buildAnalysisPrompt(prDetails, diff, fileContents, relatedFiles, patterns, reviewThreads);
+  const prompt = buildAnalysisPrompt(prDetails, diff, fileContents, relatedFiles, patterns, reviewThreads, resolvedThreads);
 
   try {
     const payload = {
@@ -417,7 +417,7 @@ async function analyzeWithClaude(prDetails, diff, fileContents, relatedFiles, pa
 /**
  * Build the analysis prompt with all context
  */
-function buildAnalysisPrompt(prDetails, diff, fileContents, relatedFiles, patterns, reviewThreads) {
+function buildAnalysisPrompt(prDetails, diff, fileContents, relatedFiles, patterns, reviewThreads, resolvedThreads = []) {
   const standardsNote = `You have access to the team standards document at .github/PR_STANDARDS.md. Reference it as the authoritative source for all standards.`;
 
   let prompt = `You are a senior code reviewer. Review this pull request against the team coding standards and identify issues.
@@ -494,6 +494,19 @@ ${diff.slice(0, 100000)}${diff.length > 100000 ? '\n... (diff truncated, see ful
         prompt += `*No user replies yet.*\n\n`;
       }
     }
+  }
+
+  // Add previously resolved threads so Claude doesn't re-raise already-addressed issues
+  if (resolvedThreads.length > 0) {
+    prompt += `\n## Previously Resolved Inline Review Threads\n\n`;
+    prompt += `The following issues were previously raised as inline comments and have since been **resolved** `;
+    prompt += `(either fixed in code or the explanation was accepted). `;
+    prompt += `Do **NOT** include these in \`new_findings\` unless the exact same problem is clearly re-introduced `;
+    prompt += `at a materially different location or in a substantially different form.\n\n`;
+    for (const thread of resolvedThreads) {
+      prompt += `- **"${thread.botTitle}"** (\`${thread.path}:${thread.line}\`)\n`;
+    }
+    prompt += '\n';
   }
 
   prompt += `
@@ -586,7 +599,7 @@ Output your findings as a single JSON code block and nothing else. Use exactly t
 Rules:
 - Output ONLY the JSON code block — no prose before or after
 - \`persisting\`: issues from existing threads that are STILL PRESENT and NOT adequately explained
-- \`new_findings\`: issues NOT covered by any existing open thread, with full \`body\`
+- \`new_findings\`: issues NOT covered by any existing open thread AND not listed in "Previously Resolved Inline Review Threads", with full \`body\`
 - \`resolved\`: existing threads where the underlying code was fixed (regardless of user replies)
 - \`accepted_explanations\`: existing threads where the user's reply is a legitimate justification even though the pattern remains
 - \`general_notes\`: PR-level concerns (bad title, missing description, etc.) — do NOT include issues that can be tied to a specific file and line
@@ -788,38 +801,41 @@ async function getReviewThreads() {
 
     const isBotLogin = login => login === 'github-actions[bot]' || login === 'github-actions';
 
-    return threads
-      .filter(t => {
-        if (t.isResolved) return false;
-        const first = t.comments?.nodes?.[0];
-        return first && isBotLogin(first.author?.login);
-      })
-      .map(t => {
-        const comments = t.comments?.nodes || [];
-        const botComment = comments[0];
-        const userReplies = comments.slice(1).filter(c => !isBotLogin(c.author?.login));
+    // All threads whose first comment is from the bot (open or resolved)
+    const botThreads = threads.filter(t => {
+      const first = t.comments?.nodes?.[0];
+      return first && isBotLogin(first.author?.login);
+    });
 
-        // Extract finding title from "🔴 **Title**" or "🟡 **Title**"
-        const titleMatch = botComment.body.match(/[🔴🟡]\s*\*\*(.*?)\*\*/);
-        const botTitle = titleMatch ? titleMatch[1].trim() : 'Unknown Issue';
+    const mapThread = t => {
+      const comments = t.comments?.nodes || [];
+      const botComment = comments[0];
+      const userReplies = comments.slice(1).filter(c => !isBotLogin(c.author?.login));
+      // Extract finding title from "🔴 **Title**" or "🟡 **Title**"
+      const titleMatch = botComment.body.match(/[🔴🟡]\s*\*\*(.*?)\*\*/);
+      const botTitle = titleMatch ? titleMatch[1].trim() : 'Unknown Issue';
+      return {
+        threadId: t.id,
+        firstCommentId: botComment.databaseId,
+        path: t.path,
+        line: t.line,
+        botTitle,
+        botBody: botComment.body,
+        userReplies: userReplies.map(r => ({
+          author: r.author?.login || 'unknown',
+          body: r.body,
+          createdAt: r.createdAt,
+        })),
+      };
+    };
 
-        return {
-          threadId: t.id,
-          firstCommentId: botComment.databaseId,
-          path: t.path,
-          line: t.line,
-          botTitle,
-          botBody: botComment.body,
-          userReplies: userReplies.map(r => ({
-            author: r.author?.login || 'unknown',
-            body: r.body,
-            createdAt: r.createdAt,
-          })),
-        };
-      });
+    return {
+      open: botThreads.filter(t => !t.isResolved).map(mapThread),
+      resolved: botThreads.filter(t => t.isResolved).map(mapThread),
+    };
   } catch (error) {
     console.warn('⚠️  Could not fetch review threads:', error.message);
-    return [];
+    return { open: [], resolved: [] };
   }
 }
 
@@ -1166,11 +1182,14 @@ async function main() {
   }
 
   try {
-    // Fetch open inline review threads for re-review context
-    console.log('🔍 Checking for open review threads...');
-    const reviewThreads = await getReviewThreads();
+    // Fetch open and resolved inline review threads for re-review context
+    console.log('🔍 Checking for review threads...');
+    const { open: reviewThreads, resolved: resolvedThreads } = await getReviewThreads();
     if (reviewThreads.length > 0) {
       console.log(`ℹ️  ${reviewThreads.length} open review thread(s) found — will compare and bump/resolve as appropriate`);
+    }
+    if (resolvedThreads.length > 0) {
+      console.log(`ℹ️  ${resolvedThreads.length} resolved thread(s) found — will use as context to avoid re-raising addressed issues`);
     }
 
     // Get the latest Claude Opus model
@@ -1198,7 +1217,7 @@ async function main() {
 
     // Analyze with Claude
     console.log('\n🤖 Analyzing PR with Claude...');
-    const rawAnalysis = await analyzeWithClaude(prDetails, diff, fileContents, relatedFiles, patterns, modelId, reviewThreads);
+    const rawAnalysis = await analyzeWithClaude(prDetails, diff, fileContents, relatedFiles, patterns, modelId, reviewThreads, resolvedThreads);
 
     // Parse the structured JSON response
     const analysisData = parseAnalysisJSON(rawAnalysis);
