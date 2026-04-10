@@ -50,6 +50,22 @@ function loadIgnoreConfig() {
 const IGNORE_CONFIG = loadIgnoreConfig();
 
 /**
+ * Load the standards document content
+ */
+function loadStandards() {
+  try {
+    if (fs.existsSync(STANDARDS_PATH)) {
+      return fs.readFileSync(STANDARDS_PATH, 'utf8');
+    }
+  } catch (error) {
+    console.warn('⚠️  Could not load standards file:', error.message);
+  }
+  return null;
+}
+
+const STANDARDS_CONTENT = loadStandards();
+
+/**
  * Check if a file should be ignored based on ignore patterns
  */
 function shouldIgnoreFile(filePath) {
@@ -365,7 +381,7 @@ function getDirectoryStructure() {
 /**
  * Call Claude Opus to analyze the PR
  */
-async function analyzeWithClaude(prDetails, diff, fileContents, relatedFiles, patterns, modelId, reviewThreads, resolvedThreads = []) {
+async function analyzeWithClaude(prDetails, diff, fileContents, relatedFiles, patterns, modelId, reviewThreads, resolvedThreads = [], incrementalDiff = null) {
   const client = new BedrockRuntimeClient({
     region: AWS_REGION,
     credentials: {
@@ -374,7 +390,7 @@ async function analyzeWithClaude(prDetails, diff, fileContents, relatedFiles, pa
     },
   });
 
-  const prompt = buildAnalysisPrompt(prDetails, diff, fileContents, relatedFiles, patterns, reviewThreads, resolvedThreads);
+  const prompt = buildAnalysisPrompt(prDetails, diff, fileContents, relatedFiles, patterns, reviewThreads, resolvedThreads, incrementalDiff);
 
   try {
     const payload = {
@@ -417,12 +433,18 @@ async function analyzeWithClaude(prDetails, diff, fileContents, relatedFiles, pa
 /**
  * Build the analysis prompt with all context
  */
-function buildAnalysisPrompt(prDetails, diff, fileContents, relatedFiles, patterns, reviewThreads, resolvedThreads = []) {
-  const standardsNote = `You have access to the team standards document at .github/PR_STANDARDS.md. Reference it as the authoritative source for all standards.`;
+function buildAnalysisPrompt(prDetails, diff, fileContents, relatedFiles, patterns, reviewThreads, resolvedThreads = [], incrementalDiff = null) {
+  let prompt = `You are a code standards enforcer. Your only job is to identify violations of the team standards documented below.
 
-  let prompt = `You are a senior code reviewer. Review this pull request against the team coding standards and identify issues.
+**Critical rules — read before doing anything else:**
+- Only report violations that are **explicitly described** in the Team Standards below.
+- Do **not** flag general best practices, style preferences, or code quality concerns that are not specifically named in the standards.
+- Do **not** leave any comment, observation, or note about code that looks correct, acceptable, or is simply not a violation. Silence is correct when there is no violation.
+- Do **not** make positive observations ("this looks good", "well structured", etc.). Output nothing for acceptable code.
 
-${standardsNote}
+## Team Standards
+
+${STANDARDS_CONTENT || '*Standards file could not be loaded. Flag nothing — do not invent standards.*'}
 
 ## PR Information
 
@@ -499,10 +521,9 @@ ${diff.slice(0, 100000)}${diff.length > 100000 ? '\n... (diff truncated, see ful
   // Add previously resolved threads so Claude doesn't re-raise already-addressed issues
   if (resolvedThreads.length > 0) {
     prompt += `\n## Previously Resolved Inline Review Threads\n\n`;
-    prompt += `The following issues were previously raised as inline comments and have since been **resolved** `;
+    prompt += `The following issues were previously raised and have been **closed** `;
     prompt += `(either fixed in code or the explanation was accepted). `;
-    prompt += `Do **NOT** include these in \`new_findings\` unless the exact same problem is clearly re-introduced `;
-    prompt += `at a materially different location or in a substantially different form.\n\n`;
+    prompt += `Do **NOT** raise these again under any circumstances — closed threads are permanently off-limits.\n\n`;
     for (const thread of resolvedThreads) {
       prompt += `- **"${thread.botTitle}"** (\`${thread.path}:${thread.line}\`)\n`;
     }
@@ -520,51 +541,34 @@ In the file contents above, ignored lines are replaced with \`// Line X ignored 
 
 ## Your Task
 
-Review this PR against the team standards in .github/PR_STANDARDS.md. Focus on:
+Review only the changed code in the diff above. Report ONLY violations that are explicitly described in the Team Standards above. If something is not addressed by the standards, do not mention it.
 
-1. **Security Issues** - SQL injection, auth/authz, token handling, input validation
-2. **Performance Problems** - N+1 queries, O(N) operations that should be O(1), memory issues
-3. **Code Quality** - Naming, organization, duplication, commented code
-4. **API Design** - RESTful patterns, error handling, i18n usage, validators
-5. **Database Standards** - Query optimization, transactions, migrations
-6. **Pattern Consistency** - Does the code follow existing patterns shown above?
+## Priority Classification
 
-## Priority Groups
+Classify each violation based on how the standards document treats it:
 
-Classify each issue into one of two groups:
+**🔴 Must Fix** (blocks merge): Violations the standards identify as blocking — typically security issues, data loss risks, or critical correctness problems.
 
-**🔴 Must Fix** (blocks merge):
-- SQL injection vulnerabilities
-- Missing authentication/authorization
-- Data loss risks in migrations
-- Transaction cleanup issues (rollback missing)
-- Hardcoded credentials or sensitive data
-- Direct file uploads to backend server (should use signed URLs)
-- Local filesystem dependencies that break in Docker/K8s
-- Individual database operations in loops instead of bulk operations (for large datasets)
-- Operations that cannot handle large data volumes (10k+ records)
-- N+1 query patterns
-- Missing validators on endpoints
+**🟡 Other** (does not block merge): Standards violations that are notable but not blocking.
 
-**🟡 Other** (notable but does not block merge):
-- Hardcoded error messages (not using i18n)
-- Missing pagination on list endpoints
-- PUT instead of PATCH for partial updates
-- Code in wrong directory (models vs services)
-- File naming violations (non-camelCase)
-- Use of \`any\` type instead of proper TypeScript types
-- New JavaScript files (.js) instead of TypeScript (.ts)
-- Missing function parameter or return type annotations
-- Commented code blocks
-- Minor naming improvements
-- console.log instead of logger
+`;
 
-${isReReview ? `
-This is a RE-REVIEW. Open inline comment threads from previous checks are listed above.
+  if (isReReview) {
+    if (incrementalDiff !== null && incrementalDiff !== '') {
+      prompt += `## Incremental Diff (New Code Since Last Review)\n\n`;
+      prompt += `The following diff contains ONLY the code added since the last review was conducted. `;
+      prompt += `\`new_findings\` must reference ONLY lines that appear as additions (\`+\`) in this incremental diff.\n\n`;
+      prompt += `\`\`\`diff\n${incrementalDiff.slice(0, 60000)}${incrementalDiff.length > 60000 ? '\n... (truncated)' : ''}\n\`\`\`\n\n`;
+    } else {
+      prompt += `## Incremental Diff (New Code Since Last Review)\n\n`;
+      prompt += `There is no new code since the last review. \`new_findings\` **must be empty** — do not open new threads on pre-existing code.\n\n`;
+    }
+
+    prompt += `This is a RE-REVIEW. Open inline comment threads from previous checks are listed above.
 
 For each existing thread, evaluate:
 1. Is the underlying issue still present in the current code?
-2. If the user replied, does their explanation legitimately justify the pattern (e.g. referencing a library that handles it, intentional design with clear rationale)?
+2. If the user replied, does their explanation legitimately justify the pattern?
 
 Output your findings as a single JSON code block and nothing else. Use exactly this schema:
 
@@ -599,17 +603,17 @@ Output your findings as a single JSON code block and nothing else. Use exactly t
 Rules:
 - Output ONLY the JSON code block — no prose before or after
 - \`persisting\`: issues from existing threads that are STILL PRESENT and NOT adequately explained
-- \`new_findings\`: issues NOT covered by any existing open thread AND not listed in "Previously Resolved Inline Review Threads", with full \`body\`
+- \`new_findings\`: issues on lines from the Incremental Diff above ONLY — do NOT open new threads on code that was present before this push; if an issue is already covered by an open thread, put it in \`persisting\`, never \`new_findings\`
 - \`resolved\`: existing threads where the underlying code was fixed (regardless of user replies)
 - \`accepted_explanations\`: existing threads where the user's reply is a legitimate justification even though the pattern remains
 - \`general_notes\`: PR-level concerns (bad title, missing description, etc.) — do NOT include issues that can be tied to a specific file and line
 - \`path\` must exactly match a file path from the Changed Files Summary above
-- \`line\` must be a line number in the NEW version of the file that appears in the diff
-- Only report issues on lines that were added or modified in this PR
+- \`line\` must be a line number in the NEW version of the file that appears in the incremental diff
 - Set \`status\` to \`BLOCK_MERGE\` if any \`must_fix\` issues exist in \`persisting\` or \`new_findings\`
 - Omit empty arrays from the output
-` : `
-Output your findings as a single JSON code block and nothing else. Use exactly this schema:
+`;
+  } else {
+    prompt += `Output your findings as a single JSON code block and nothing else. Use exactly this schema:
 
 \`\`\`json
 {
@@ -636,8 +640,8 @@ Rules:
 - \`general_notes\`: PR-level concerns (bad title, missing description, etc.) — do NOT include issues that can be tied to a specific file and line
 - Set \`status\` to \`BLOCK_MERGE\` if any \`must_fix\` findings exist
 - Omit empty arrays from the output
-`}
 `;
+  }
 
   return prompt;
 }
@@ -817,6 +821,7 @@ async function getReviewThreads() {
       return {
         threadId: t.id,
         firstCommentId: botComment.databaseId,
+        firstCommentCreatedAt: botComment.createdAt,
         path: t.path,
         line: t.line,
         botTitle,
@@ -840,6 +845,56 @@ async function getReviewThreads() {
 }
 
 /**
+ * Get the diff covering only commits added since the last review ran.
+ * Returns the diff string (possibly empty if no new commits), or null on error.
+ */
+async function getIncrementalDiff(reviewThreads) {
+  if (!reviewThreads || reviewThreads.length === 0) return null;
+
+  // Find the timestamp of the most recently created bot thread
+  const latestReviewAt = reviewThreads.reduce((latest, t) => {
+    return t.firstCommentCreatedAt > latest ? t.firstCommentCreatedAt : latest;
+  }, '');
+
+  if (!latestReviewAt) return null;
+
+  try {
+    const commitsJson = execSync(
+      `gh api "repos/${REPO}/pulls/${PR_NUMBER}/commits?per_page=100"`,
+      { encoding: 'utf8' }
+    );
+    const commits = JSON.parse(commitsJson);
+
+    // Commits are returned oldest-first; find those pushed after the last review
+    const newCommits = commits.filter(c => {
+      const commitDate = c.commit.author.date || c.commit.committer.date;
+      return commitDate > latestReviewAt;
+    });
+
+    if (newCommits.length === 0) {
+      console.log('  ℹ️  No new commits since last review — new findings scope is empty');
+      return '';
+    }
+
+    // The review base is the parent of the first new commit
+    const reviewBaseSha = newCommits[0].parents?.[0]?.sha;
+    if (!reviewBaseSha) return null;
+
+    const headSha = commits[commits.length - 1].sha;
+    console.log(`  ℹ️  Incremental diff: ${reviewBaseSha.slice(0, 7)}..${headSha.slice(0, 7)} (${newCommits.length} new commit(s))`);
+
+    const diff = execSync(
+      `gh api "repos/${REPO}/compare/${reviewBaseSha}...${headSha}" -H "Accept: application/vnd.github.v3.diff"`,
+      { encoding: 'utf8' }
+    );
+    return diff;
+  } catch (error) {
+    console.warn('⚠️  Could not compute incremental diff, will use full diff for new findings:', error.message);
+    return null;
+  }
+}
+
+/**
  * Resolve an inline review thread via GraphQL.
  */
 async function resolveReviewThread(threadId) {
@@ -854,11 +909,14 @@ async function resolveReviewThread(threadId) {
     const result = runGraphQL(mutation, { id: threadId });
     if (result.data?.resolveReviewThread?.thread?.isResolved === true) {
       console.log(`  ✓ Resolved thread ${threadId}`);
+      return true;
     } else {
       console.warn(`  ⚠️  resolveReviewThread returned unexpected response for ${threadId}:`, JSON.stringify(result));
+      return false;
     }
   } catch (error) {
     console.warn(`  ⚠️  Could not resolve thread ${threadId}:`, error.message);
+    return false;
   }
 }
 
@@ -1067,19 +1125,38 @@ function buildReviewBody(data, isReReview, modelId, unplaceable) {
  * On re-reviews, persisting issues are bumped as replies on existing threads rather
  * than posted as new inline comments, and resolved/accepted threads are closed.
  */
-async function postReview(data, diff, modelId, isReReview, reviewThreads = []) {
+async function postReview(data, diff, modelId, isReReview, reviewThreads = [], incrementalDiff = null, resolvedThreads = []) {
   const validLines = parseDiffForValidLines(diff);
+  // For re-reviews, new_findings are only valid on lines from the incremental diff.
+  // null incrementalDiff means we couldn't compute it — fall back to full diff to be safe.
+  const newFindingValidLines = isReReview
+    ? (incrementalDiff !== null ? parseDiffForValidLines(incrementalDiff) : validLines)
+    : validLines;
 
   // Determine which findings need new inline comments
-  const findingsForInline = isReReview
+  let findingsForInline = isReReview
     ? (data.new_findings || [])
     : (data.findings || []);
+
+  // On re-reviews, hard-enforce deduplication: drop any new finding that matches an open
+  // or resolved thread, regardless of whether Claude respected the prompt instructions.
+  if (isReReview) {
+    const allPriorThreads = [...reviewThreads, ...resolvedThreads];
+    findingsForInline = findingsForInline.filter(finding => {
+      const duplicate = findMatchingThread(allPriorThreads, finding.title, finding.path);
+      if (duplicate) {
+        console.log(`  ℹ️  Dropping duplicate new finding "${finding.title}" — already covered by an existing thread`);
+        return false;
+      }
+      return true;
+    });
+  }
 
   const inlineComments = [];
   const unplaceable = [];
 
   for (const finding of findingsForInline) {
-    const fileLines = validLines.get(finding.path);
+    const fileLines = newFindingValidLines.get(finding.path);
     if (fileLines && fileLines.has(finding.line)) {
       const icon = finding.priority === 'must_fix' ? '🔴' : '🟡';
       inlineComments.push({
@@ -1114,15 +1191,17 @@ async function postReview(data, diff, modelId, isReReview, reviewThreads = []) {
 
   if (!isReReview) return;
 
-  // Re-review: bump persisting threads with a reply instead of posting duplicate inline comments
+  // Re-review: bump persisting threads only when the user has replied (avoid bot-to-bot noise)
   for (const finding of (data.persisting || [])) {
     const thread = findMatchingThread(reviewThreads, finding.title, finding.path);
     if (thread) {
-      const icon = finding.priority === 'must_fix' ? '🔴' : '🟡';
-      const bumpBody = finding.bump_message
-        ? `${icon} **Still open.** ${finding.bump_message}`
-        : `${icon} **Still open.** This issue has not been resolved yet.`;
-      await replyToReviewComment(thread.firstCommentId, bumpBody);
+      if (thread.userReplies.length > 0) {
+        const icon = finding.priority === 'must_fix' ? '🔴' : '🟡';
+        const bumpBody = finding.bump_message
+          ? `${icon} **Still open.** ${finding.bump_message}`
+          : `${icon} **Still open.** This issue has not been resolved yet.`;
+        await replyToReviewComment(thread.firstCommentId, bumpBody);
+      }
     } else {
       console.log(`  ⚠️  No matching thread found for persisting issue: "${finding.title}"`);
     }
@@ -1136,12 +1215,15 @@ async function postReview(data, diff, modelId, isReReview, reviewThreads = []) {
     }
   }
 
-  // Accept explanations: reply with acknowledgement then resolve
+  // Accept explanations: resolve first, then reply with the actual outcome
   for (const title of (data.accepted_explanations || [])) {
     const thread = findMatchingThread(reviewThreads, title, null);
     if (thread) {
-      await replyToReviewComment(thread.firstCommentId, '✅ Explanation accepted. Resolving this comment.');
-      await resolveReviewThread(thread.threadId);
+      const resolved = await resolveReviewThread(thread.threadId);
+      const replyBody = resolved
+        ? '✅ Explanation accepted. This thread has been resolved.'
+        : '✅ Explanation accepted. This thread could not be automatically resolved — please resolve it manually.';
+      await replyToReviewComment(thread.firstCommentId, replyBody);
     }
   }
 }
@@ -1192,6 +1274,13 @@ async function main() {
       console.log(`ℹ️  ${resolvedThreads.length} resolved thread(s) found — will use as context to avoid re-raising addressed issues`);
     }
 
+    // For re-reviews, compute the incremental diff (code added since the last review)
+    let incrementalDiff = null;
+    if (reviewThreads.length > 0) {
+      console.log('📥 Computing incremental diff since last review...');
+      incrementalDiff = await getIncrementalDiff(reviewThreads);
+    }
+
     // Get the latest Claude Opus model
     console.log('🔍 Fetching latest Claude Opus model...');
     const modelId = await getLatestClaudeOpusModel();
@@ -1217,7 +1306,7 @@ async function main() {
 
     // Analyze with Claude
     console.log('\n🤖 Analyzing PR with Claude...');
-    const rawAnalysis = await analyzeWithClaude(prDetails, diff, fileContents, relatedFiles, patterns, modelId, reviewThreads, resolvedThreads);
+    const rawAnalysis = await analyzeWithClaude(prDetails, diff, fileContents, relatedFiles, patterns, modelId, reviewThreads, resolvedThreads, incrementalDiff);
 
     // Parse the structured JSON response
     const analysisData = parseAnalysisJSON(rawAnalysis);
@@ -1228,7 +1317,7 @@ async function main() {
     // Post review with inline comments; bump/resolve existing threads on re-review
     console.log('💬 Posting review with inline comments...');
     const isReReview = reviewThreads.length > 0;
-    await postReview(analysisData, diff, modelId, isReReview, reviewThreads);
+    await postReview(analysisData, diff, modelId, isReReview, reviewThreads, incrementalDiff, resolvedThreads);
 
     // Post any general PR-level notes as a plain conversation comment
     if (analysisData.general_notes?.length) {
