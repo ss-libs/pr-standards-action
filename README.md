@@ -26,6 +26,10 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
 
+concurrency:
+  group: pr-standards-${{ github.repository }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
 jobs:
   pr-standards:
     if: ${{ !github.event.pull_request.draft && !github.event.pull_request.merged }}
@@ -48,6 +52,10 @@ jobs:
           bedrock-aws-access-key-id: ${{ secrets.BEDROCK_AWS_ACCESS_KEY_ID }}
           bedrock-aws-secret-access-key: ${{ secrets.BEDROCK_AWS_SECRET_ACCESS_KEY }}
 ```
+
+Keep standards-check runs serialized per PR with the concurrency group above. Retry handling prevents repeated replies across completed runs, but overlapping runs can read the same thread state before either posts a reply. Use the same group for any additional workflow that invokes this action on that PR.
+
+This example runs on PR creation, new commits, reopening, and readiness for review. A reviewer reply alone does not trigger it; explanations are evaluated on the next standards-check run. The token needs `pull-requests: write` to reply to and resolve threads. If GitHub denies resolution, the action reports the failure instead of claiming the thread was closed.
 
 ## Inputs
 
